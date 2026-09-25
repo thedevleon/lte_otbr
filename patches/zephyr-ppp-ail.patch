@@ -1,0 +1,606 @@
+diff --git a/modules/openthread/platform/border_agent.c b/modules/openthread/platform/border_agent.c
+index 4c39c4c9d47..979209307dc 100644
+--- a/modules/openthread/platform/border_agent.c
++++ b/modules/openthread/platform/border_agent.c
+@@ -7,12 +7,10 @@
+ #include <platform-zephyr.h>
+ #include <openthread/border_agent.h>
+ #include <openthread/cli.h>
+-#include <openthread/dns.h>
+ #include <openthread/thread.h>
+ #include <openthread/verhoeff_checksum.h>
+ #include <openthread/platform/entropy.h>
+ #include "common/code_utils.hpp"
+-#include "openthread_border_router.h"
+ #include <zephyr/sys/byteorder.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -24,7 +22,13 @@ static struct otInstance *ot_instance_ptr;
+ static bool border_agent_is_init;
+ 
+ #if defined(CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE)
+-static otBorderAgentEphemeralKeyTap eph_passcode;
++/* The bundled sdk-openthread fork (ncs-thread-reference-20250402) predates the
++ * TAP-based ePSKc API (otBorderAgentEphemeralKeyTap, otBorderAgentEphemeralKeyStart,
++ * ...); it exposes the older otBorderAgentSetEphemeralKey() string API instead.
++ */
++#define EPSKC_PASSCODE_LENGTH 9 /* 8 random digits + Verhoeff check digit */
++
++static char eph_passcode[EPSKC_PASSCODE_LENGTH + 1];
+ 
+ static uint32_t ephemeral_key_timeout;
+ static bool epskc_active;
+@@ -38,8 +42,6 @@ static int border_agent_eph_key_run(size_t argc, char **argv);
+ 
+ #endif /* CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE */
+ 
+-static void append_vendor_txt_data(uint8_t *txt_data, uint16_t *txt_data_len);
+-
+ otError border_agent_init(otInstance *instance)
+ {
+ 	otError error = OT_ERROR_NONE;
+@@ -47,62 +49,27 @@ otError border_agent_init(otInstance *instance)
+ 	ot_instance_ptr = instance;
+ 
+ 	if (!border_agent_is_init) {
+-		uint8_t txt_buffer[128] = {0};
+-		uint16_t txt_buffer_len = 0;
+-
+-		VerifyOrExit(otBorderAgentSetMeshCoPServiceBaseName(instance,
+-								    otbr_base_service_instance_name)
+-			     == OT_ERROR_NONE, error = OT_ERROR_FAILED);
+-		append_vendor_txt_data(txt_buffer, &txt_buffer_len);
+-		otBorderAgentSetVendorTxtData(instance, txt_buffer, txt_buffer_len);
+ #if defined(CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE)
+-		otBorderAgentEphemeralKeySetEnabled(instance, true);
+-		otBorderAgentEphemeralKeySetCallback(instance,
++		otBorderAgentSetEphemeralKeyCallback(instance,
+ 						     handle_border_agent_ephemeral_key_callback,
+ 						     instance);
+ #endif /* CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE */
+ 
+ 		border_agent_is_init = true;
+ 	}
+-exit:
++
+ 	return error;
+ }
+ 
+ void border_agent_deinit(void)
+ {
+ #if defined(CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE)
+-	otBorderAgentEphemeralKeySetEnabled(ot_instance_ptr, false);
++	otBorderAgentClearEphemeralKey(ot_instance_ptr);
+ 	epskc_active = false;
+ #endif /* CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE */
+ 	border_agent_is_init = false;
+ }
+ 
+-static void append_vendor_txt_data(uint8_t *txt_data, uint16_t *txt_data_len)
+-{
+-	*txt_data_len = 0;
+-	size_t i = 0;
+-	otDnsTxtEntry txt_entries[] = {
+-				       {.mKey = "vn", .mValue = (uint8_t *)otbr_vendor_name,
+-					.mValueLength = strlen(otbr_vendor_name)},
+-				       {.mKey = "mn", .mValue = (uint8_t *)otbr_model_name,
+-					.mValueLength = strlen(otbr_model_name)}};
+-
+-	for (i = 0; i < ARRAY_SIZE(txt_entries); ++i) {
+-		const otDnsTxtEntry *entry    = &txt_entries[i];
+-		uint8_t key_len   = (uint8_t)strlen(entry->mKey);
+-		uint8_t total_len = key_len + 1 + entry->mValueLength; /* +1 for '=' */
+-
+-		txt_data[(*txt_data_len)++] = total_len;
+-		memcpy(txt_data + *txt_data_len, entry->mKey, key_len);
+-		*txt_data_len += key_len;
+-
+-		txt_data[(*txt_data_len)++] = '=';
+-		memcpy(txt_data + *txt_data_len, entry->mValue, entry->mValueLength);
+-		*txt_data_len += entry->mValueLength;
+-	}
+-
+-}
+-
+ #if defined(CONFIG_OPENTHREAD_BORDER_AGENT_EPHEMERAL_KEY_ENABLE)
+ 
+ /** Defining functions below as weak allows applications to implement their specific behaviour,
+@@ -126,33 +93,48 @@ __weak void print_ephemeral_key_expired_message(void)
+ static void handle_border_agent_ephemeral_key_callback(void *context)
+ {
+ 	char formatted_epskc[12] = {0};
+-	otBorderAgentEphemeralKeyState eph_key_state;
++	bool key_active;
+ 
+-	eph_key_state = otBorderAgentEphemeralKeyGetState((otInstance *)context);
++	key_active = otBorderAgentIsEphemeralKeyActive((otInstance *)context);
+ 
+-	switch (eph_key_state) {
+-	case OT_BORDER_AGENT_STATE_STOPPED:
+-		if (epskc_active) {
+-			epskc_active = false;
+-			print_ephemeral_key_expired_message();
+-		}
+-		break;
+-
+-	case OT_BORDER_AGENT_STATE_STARTED:
++	if (key_active && !epskc_active) {
+ 		snprintf(formatted_epskc, sizeof(formatted_epskc), "%.3s %.3s %.3s",
+-			 eph_passcode.mTap, eph_passcode.mTap + 3,
+-			 eph_passcode.mTap + 6);
++			 eph_passcode, eph_passcode + 3,
++			 eph_passcode + 6);
+ 		print_ephemeral_key(formatted_epskc, (uint32_t)(ephemeral_key_timeout / 1000UL));
+ 		epskc_active = true;
+-		break;
++	} else if (!key_active && epskc_active) {
++		epskc_active = false;
++		print_ephemeral_key_expired_message();
++	}
++}
+ 
+-	case OT_BORDER_AGENT_STATE_CONNECTED:
+-		/* connected to */
+-	case OT_BORDER_AGENT_STATE_ACCEPTED:
+-	default:
+-		break;
++static otError border_agent_generate_passcode(void)
++{
++	otError error = OT_ERROR_NONE;
++	uint8_t rand_bytes[EPSKC_PASSCODE_LENGTH - 1];
++	char check_digit;
++
++	VerifyOrExit(otPlatEntropyGet(rand_bytes, sizeof(rand_bytes)) == OT_ERROR_NONE,
++		     error = OT_ERROR_FAILED);
++
++	for (size_t i = 0; i < sizeof(rand_bytes); i++) {
++		eph_passcode[i] = (char)('0' + (rand_bytes[i] % 10));
+ 	}
++	eph_passcode[EPSKC_PASSCODE_LENGTH - 1] = '\0';
++
++	VerifyOrExit(otVerhoeffChecksumCalculate(eph_passcode, &check_digit) == OT_ERROR_NONE,
++		     error = OT_ERROR_FAILED);
++	eph_passcode[EPSKC_PASSCODE_LENGTH - 1] = check_digit;
++	eph_passcode[EPSKC_PASSCODE_LENGTH] = '\0';
++
++	VerifyOrExit(otVerhoeffChecksumValidate(eph_passcode) == OT_ERROR_NONE,
++		     error = OT_ERROR_FAILED);
++
++exit:
++	return error;
+ }
++
+ static otError border_agent_enable_epskc_service(uint32_t timeout)
+ {
+ 	otError error = OT_ERROR_NONE;
+@@ -164,14 +146,11 @@ static otError border_agent_enable_epskc_service(uint32_t timeout)
+ 				   timeout <= OT_BORDER_AGENT_MAX_EPHEMERAL_KEY_TIMEOUT) ?
+ 				   timeout : OT_BORDER_AGENT_DEFAULT_EPHEMERAL_KEY_TIMEOUT;
+ 
+-	VerifyOrExit(otBorderAgentEphemeralKeyGenerateTap(&eph_passcode) == OT_ERROR_NONE,
+-		     error = OT_ERROR_FAILED);
+-	VerifyOrExit(otBorderAgentEphemeralKeyValidateTap(&eph_passcode) == OT_ERROR_NONE,
++	VerifyOrExit(border_agent_generate_passcode() == OT_ERROR_NONE,
+ 		     error = OT_ERROR_FAILED);
+ 
+-	error = otBorderAgentEphemeralKeyStart(ot_instance_ptr,
+-					       (const char *)eph_passcode.mTap,
+-					       ephemeral_key_timeout, 0);
++	error = otBorderAgentSetEphemeralKey(ot_instance_ptr, eph_passcode,
++					     ephemeral_key_timeout, 0);
+ 
+ exit:
+ 	return error;
+diff --git a/modules/openthread/platform/infra_if.c b/modules/openthread/platform/infra_if.c
+index 2d3e301944d..e1ed58158d3 100644
+--- a/modules/openthread/platform/infra_if.c
++++ b/modules/openthread/platform/infra_if.c
+@@ -129,19 +129,6 @@ bool otPlatInfraIfHasAddress(uint32_t aInfraIfIndex, const otIp6Address *aAddres
+ 	return false;
+ }
+ 
+-otError otPlatGetInfraIfLinkLayerAddress(otInstance *aInstance, uint32_t aIfIndex,
+-					 otPlatInfraIfLinkLayerAddress *aInfraIfLinkLayerAddress)
+-{
+-	OT_UNUSED_VARIABLE(aInstance);
+-	struct net_if *iface = net_if_get_by_index(aIfIndex);
+-	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
+-
+-	aInfraIfLinkLayerAddress->mLength = link_addr->len;
+-	memcpy(aInfraIfLinkLayerAddress->mAddress, link_addr->addr, link_addr->len);
+-
+-	return OT_ERROR_NONE;
+-}
+-
+ otError infra_if_init(otInstance *instance, struct net_if *ail_iface)
+ {
+ 	otError error = OT_ERROR_NONE;
+@@ -409,6 +396,10 @@ exit:
+ 
+ static void remove_checksums_for_eth_offloading(uint8_t *buf, uint16_t len)
+ {
++#if !defined(CONFIG_NET_L2_ETHERNET)
++	ARG_UNUSED(buf);
++	ARG_UNUSED(len); /* Checksum offload is an Ethernet-only concept */
++#else
+ 	struct net_ipv4_hdr *ipv4_hdr = (struct net_ipv4_hdr *)buf;
+ 	uint8_t *pkt_cursor = NULL;
+ 	struct ethernet_config config;
+@@ -453,6 +444,7 @@ static void remove_checksums_for_eth_offloading(uint8_t *buf, uint16_t len)
+ 	default:
+ 		break;
+ 	}
++#endif /* !CONFIG_NET_L2_ETHERNET */
+ }
+ 
+ static bool infra_if_nat64_try_consume_packet(struct npf_test *test, struct net_pkt *pkt)
+diff --git a/modules/openthread/platform/mdns_socket.c b/modules/openthread/platform/mdns_socket.c
+index 8c2ca7eb6bb..45b3d681daf 100644
+--- a/modules/openthread/platform/mdns_socket.c
++++ b/modules/openthread/platform/mdns_socket.c
+@@ -476,46 +476,10 @@ exit:
+ 
+ void mdns_plat_monitor_interface(struct net_if *ail_iface)
+ {
+-	struct net_if_ipv6 *ipv6 = NULL;
+-	otIp6Address ip6_addr = {0};
+-	struct net_if_addr *unicast = NULL;
+-
+-	net_if_lock(ail_iface);
+-
+-	otPlatMdnsHandleHostAddressRemoveAll(ot_instance_ptr, ail_iface_index);
+-
+-	ipv6 = ail_iface->config.ip.ipv6;
+-	ARRAY_FOR_EACH(ipv6->unicast, idx) {
+-		unicast = &ipv6->unicast[idx];
+-
+-		if (!unicast->is_used) {
+-			continue;
+-		}
+-		memcpy(&ip6_addr.mFields.m32, &unicast->address.in6_addr.s6_addr32,
+-		       sizeof(otIp6Address));
+-		otPlatMdnsHandleHostAddressEvent(ot_instance_ptr, &ip6_addr, true,
+-						 ail_iface_index);
+-	}
+-	if (IS_ENABLED(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_IPV4) &&
+-	    IS_ENABLED(CONFIG_NET_IPV4_MAPPING_TO_IPV6) &&
+-	    openthread_border_router_has_ipv4_connectivity()) {
+-		struct net_if_ipv4 *ipv4 = NULL;
+-		otIp4Address ip4_addr = {0};
+-
+-		ipv4 = ail_iface->config.ip.ipv4;
+-		ARRAY_FOR_EACH(ipv4->unicast, idx) {
+-			unicast = &ipv4->unicast[idx].ipv4;
+-
+-			if (!unicast->is_used) {
+-				continue;
+-			}
+-			memcpy(&ip4_addr.mFields.m32, &unicast->address.in_addr.s4_addr32,
+-			       sizeof(otIp4Address));
+-			otIp4ToIp4MappedIp6Address(&ip4_addr, &ip6_addr);
+-			otPlatMdnsHandleHostAddressEvent(ot_instance_ptr, &ip6_addr, true,
+-							 ail_iface_index);
+-		}
+-	}
+-
+-	net_if_unlock(ail_iface);
++	/* The bundled sdk-openthread fork (ncs-thread-reference-20250402) uses the
++	 * older mDNS platform API and has no otPlatMdnsHandleHostAddressEvent /
++	 * otPlatMdnsHandleHostAddressRemoveAll, so host address reporting towards
++	 * the OpenThread core is not possible here.
++	 */
++	ARG_UNUSED(ail_iface);
+ }
+diff --git a/modules/openthread/platform/udp.c b/modules/openthread/platform/udp.c
+index 8b97291e991..550dce304bb 100644
+--- a/modules/openthread/platform/udp.c
++++ b/modules/openthread/platform/udp.c
+@@ -183,7 +183,7 @@ otError otPlatUdpBindToNetif(otUdpSocket *aUdpSocket, otNetifIdentifier aNetifId
+ 					      NULL, 0) == 0,
+ 			     error = OT_ERROR_FAILED);
+ 		break;
+-	case OT_NETIF_THREAD_HOST:
++	case OT_NETIF_THREAD:
+ 		VerifyOrExit(net_if_get_name(ot_iface_ptr, name, CONFIG_NET_INTERFACE_NAME_LEN) > 0,
+ 			     error = OT_ERROR_FAILED);
+ 		memcpy(if_req.ifr_name, name, MIN(sizeof(name) - 1, sizeof(if_req.ifr_name) - 1));
+@@ -191,8 +191,6 @@ otError otPlatUdpBindToNetif(otUdpSocket *aUdpSocket, otNetifIdentifier aNetifId
+ 					      &if_req, sizeof(if_req)) == 0,
+ 			     error = OT_ERROR_FAILED);
+ 		break;
+-	case OT_NETIF_THREAD_INTERNAL:
+-		assert(false);
+ 	case OT_NETIF_BACKBONE:
+ 		VerifyOrExit(net_if_get_name(ail_iface_ptr, name,
+ 					     CONFIG_NET_INTERFACE_NAME_LEN) > 0,
+@@ -273,7 +271,7 @@ otError otPlatUdpSend(otUdpSocket *aUdpSocket,
+ 	peer.sin6_port = net_htons(aMessageInfo->mPeerPort);
+ 	memcpy(&peer.sin6_addr, &aMessageInfo->mPeerAddr, sizeof(otIp6Address));
+ 
+-	if (otIp6IsLinkLocalUnicast((const otIp6Address *)&aMessageInfo->mPeerAddr)) {
++	if (net_ipv6_is_ll_addr((const struct net_in6_addr *)&aMessageInfo->mPeerAddr)) {
+ 		if (aMessageInfo->mIsHostInterface) {
+ 			peer.sin6_scope_id = ail_iface_index;
+ 		} else {
+@@ -363,11 +361,9 @@ otError otPlatUdpJoinMulticastGroup(otUdpSocket *aUdpSocket, otNetifIdentifier a
+ 	switch (aNetifIdentifier) {
+ 	case OT_NETIF_UNSPECIFIED:
+ 		break;
+-	case OT_NETIF_THREAD_HOST:
++	case OT_NETIF_THREAD:
+ 		mreq.ipv6mr_ifindex = ot_iface_index;
+ 		break;
+-	case OT_NETIF_THREAD_INTERNAL:
+-		assert(false);
+ 	case OT_NETIF_BACKBONE:
+ 		mreq.ipv6mr_ifindex = ail_iface_index;
+ 		break;
+@@ -399,11 +395,9 @@ otError otPlatUdpLeaveMulticastGroup(otUdpSocket *aUdpSocket, otNetifIdentifier
+ 	switch (aNetifIdentifier) {
+ 	case OT_NETIF_UNSPECIFIED:
+ 		break;
+-	case OT_NETIF_THREAD_HOST:
++	case OT_NETIF_THREAD:
+ 		mreq.ipv6mr_ifindex = ot_iface_index;
+ 		break;
+-	case OT_NETIF_THREAD_INTERNAL:
+-		assert(false);
+ 	case OT_NETIF_BACKBONE:
+ 		mreq.ipv6mr_ifindex = ail_iface_index;
+ 		break;
+diff --git a/subsys/net/l2/openthread/openthread_border_router.c b/subsys/net/l2/openthread/openthread_border_router.c
+index 5865e0de58d..9b08e511070 100644
+--- a/subsys/net/l2/openthread/openthread_border_router.c
++++ b/subsys/net/l2/openthread/openthread_border_router.c
+@@ -21,6 +21,9 @@
+ #include <route.h>
+ #include <route_ipv6.h>
+ #include <zephyr/net/ethernet.h>
++#if defined(CONFIG_NET_L2_PPP)
++#include <zephyr/net/ppp.h>
++#endif /* CONFIG_NET_L2_PPP */
+ #include <zephyr/net/net_core.h>
+ #include <zephyr/net/net_ip.h>
+ #include <zephyr/net/net_pkt.h>
+@@ -97,10 +100,12 @@ int openthread_start_border_router_services_ipv6(struct net_if *ot_iface, struct
+ #endif /* CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_MDNS_AUTO_NAMING */
+ 
+ 	/* Initialize platform modules first */
++#if defined(CONFIG_OPENTHREAD_TREL)
+ 	if (trel_plat_init(instance, ail_iface_ptr) != OT_ERROR_NONE) {
+ 		error = -EIO;
+ 		goto exit;
+ 	}
++#endif /* CONFIG_OPENTHREAD_TREL */
+ 
+ 	if (infra_if_init(instance, ail_iface_ptr) != OT_ERROR_NONE) {
+ 		error = -EIO;
+@@ -114,10 +119,12 @@ int openthread_start_border_router_services_ipv6(struct net_if *ot_iface, struct
+ 		error = -EIO;
+ 		goto exit;
+ 	}
++#if defined(CONFIG_OPENTHREAD_BORDER_ROUTING_DHCP6_PD)
+ 	if (dhcpv6_pd_client_init(instance, ail_iface_index) != OT_ERROR_NONE) {
+ 		error = -EIO;
+ 		goto exit;
+ 	}
++#endif /* CONFIG_OPENTHREAD_BORDER_ROUTING_DHCP6_PD */
+ 
+ 	if (border_agent_init(instance) != OT_ERROR_NONE) {
+ 		error = -EIO;
+@@ -140,9 +147,10 @@ int openthread_start_border_router_services_ipv6(struct net_if *ot_iface, struct
+ 		error = -EIO;
+ 		goto exit;
+ 	}
+-	if (!otBorderAgentIsEnabled(instance)) {
+-		otBorderAgentSetEnabled(instance, true);
+-	}
++	/* The bundled sdk-openthread fork (ncs-thread-reference-20250402) has no
++	 * otBorderAgentSetEnabled() API - the Border Agent starts automatically
++	 * with the Thread interface there.
++	 */
+ 	if (otPlatInfraIfStateChanged(instance, ail_iface_index, true) != OT_ERROR_NONE) {
+ 		error = -EIO;
+ 		goto exit;
+@@ -152,8 +160,12 @@ int openthread_start_border_router_services_ipv6(struct net_if *ot_iface, struct
+ 		otDnssdUpstreamQuerySetEnabled(instance, true);
+ 	}
+ 
++#if defined(CONFIG_OPENTHREAD_BORDER_ROUTING_DHCP6_PD)
+ 	otBorderRoutingDhcp6PdSetEnabled(instance, true);
++#endif /* CONFIG_OPENTHREAD_BORDER_ROUTING_DHCP6_PD */
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 	otBackboneRouterSetEnabled(instance, true);
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 	otSrpServerSetAutoEnableMode(instance, true);
+ 
+ 	openthread_mutex_unlock();
+@@ -210,11 +222,15 @@ static int openthread_stop_border_router_services(struct net_if *ot_iface,
+ 			error = -EIO;
+ 			goto exit;
+ 		}
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 		otBackboneRouterSetEnabled(instance, false);
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 		border_agent_deinit();
+ 		(void)infra_if_deinit();
+ 		infra_if_stop_icmp6_listener();
+-		otBorderAgentSetEnabled(instance, false);
++		/* No otBorderAgentSetEnabled() in the bundled sdk-openthread fork;
++		 * border_agent_deinit() above tears down the platform side.
++		 */
+ 		udp_plat_deinit();
+ #if defined(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_NAT64_TRANSLATOR)
+ 		openthread_border_router_stop_nat64_service();
+@@ -237,16 +253,40 @@ void openthread_set_bbr_multicast_listener_cb(openthread_bbr_multicast_listener_
+ {
+ 	__ASSERT(cb != NULL, "Receive callback is not set");
+ 
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 	openthread_mutex_lock();
+ 	otBackboneRouterSetMulticastListenerCallback(openthread_get_default_instance(), cb,
+ 						     context);
+ 	openthread_mutex_unlock();
++#else
++	ARG_UNUSED(cb);
++	ARG_UNUSED(context);
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
++}
++
++static bool is_ail_l2(struct net_if *iface)
++{
++	const struct net_l2 *l2 = net_if_l2(iface);
++
++#if defined(CONFIG_NET_L2_ETHERNET)
++	if (l2 == &NET_L2_GET_NAME(ETHERNET)) {
++		return true;
++	}
++#endif /* CONFIG_NET_L2_ETHERNET */
++
++#if defined(CONFIG_NET_L2_PPP)
++	if (l2 == &NET_L2_GET_NAME(PPP)) {
++		return true;
++	}
++#endif /* CONFIG_NET_L2_PPP */
++
++	return false;
+ }
+ 
+ static void ail_connection_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event,
+ 				   struct net_if *iface)
+ {
+-	if (net_if_l2(iface) != &NET_L2_GET_NAME(ETHERNET)) {
++	if (!is_ail_l2(iface)) {
+ 		return;
+ 	}
+ 
+@@ -280,7 +320,7 @@ static void ail_ipv6_address_event_handler(struct net_mgmt_event_callback *cb, u
+ 					   struct net_if *iface)
+ {
+ 
+-	if (net_if_l2(iface) != &NET_L2_GET_NAME(ETHERNET)) {
++	if (!is_ail_l2(iface)) {
+ 		return;
+ 	}
+ 
+@@ -295,7 +335,7 @@ static void ail_ipv6_address_event_handler(struct net_mgmt_event_callback *cb, u
+ static void ail_ipv4_address_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event,
+ 					   struct net_if *iface)
+ {
+-	if (net_if_l2(iface) != &NET_L2_GET_NAME(ETHERNET)) {
++	if (!is_ail_l2(iface)) {
+ 		return;
+ 	}
+ 
+@@ -325,6 +365,7 @@ static void ail_ipv4_address_event_handler(struct net_mgmt_event_callback *cb, u
+ }
+ #endif /* CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_IPV4 */
+ 
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ static void ot_bbr_multicast_listener_handler(void *context,
+ 					      otBackboneRouterMulticastListenerEvent event,
+ 					      const otIp6Address *address)
+@@ -370,6 +411,7 @@ static void ot_bbr_multicast_listener_handler(void *context,
+ 		}
+ 	}
+ }
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 
+ void openthread_border_router_init(struct openthread_context *ot_ctx)
+ {
+@@ -388,7 +430,11 @@ void openthread_border_router_init(struct openthread_context *ot_ctx)
+ #endif /* CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_IPV4 */
+ 
+ 	udp_plat_init_sockfd();
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 	openthread_set_bbr_multicast_listener_cb(ot_bbr_multicast_listener_handler, (void *)ot_ctx);
++#else
++	ARG_UNUSED(ot_ctx);
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 	(void)infra_if_start_icmp6_listener();
+ }
+ 
+@@ -492,6 +538,7 @@ bool openthread_border_router_has_ipv4_connectivity(void)
+ 
+ static bool openthread_border_router_has_multicast_listener(const uint8_t *address)
+ {
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 	otInstance *instance = openthread_get_default_instance();
+ 	otBackboneRouterMulticastListenerIterator iterator = 0;
+ 	otBackboneRouterMulticastListenerInfo info;
+@@ -502,6 +549,9 @@ static bool openthread_border_router_has_multicast_listener(const uint8_t *addre
+ 			return true;
+ 		}
+ 	}
++#else
++	ARG_UNUSED(address);
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 
+ 	return false;
+ }
+@@ -518,6 +568,7 @@ static bool openthread_border_router_can_forward_multicast(struct net_pkt *pkt)
+ 	}
+ 
+ 	if (net_ipv6_is_addr_mcast_raw(hdr->dst)) {
++#if defined(CONFIG_OPENTHREAD_BACKBONE_ROUTER)
+ 		/* A secondary BBR should not forward onto an external iface
+ 		 * or from external network.
+ 		 */
+@@ -525,6 +576,7 @@ static bool openthread_border_router_can_forward_multicast(struct net_pkt *pkt)
+ 		    otBackboneRouterGetState(instance) == OT_BACKBONE_ROUTER_STATE_DISABLED) {
+ 			return false;
+ 		}
++#endif /* CONFIG_OPENTHREAD_BACKBONE_ROUTER */
+ 		/* AIL to Thread network message */
+ 		if (net_pkt_orig_iface(pkt) == ail_iface_ptr) {
+ 			if (openthread_border_router_has_multicast_listener(hdr->dst)) {
+@@ -639,6 +691,7 @@ bool openthread_border_router_check_packet_forwarding_rules(struct net_pkt *pkt)
+ 
+ static void openthread_border_router_add_or_rm_route_to_multicast_groups(bool add)
+ {
++#if defined(CONFIG_NET_ROUTE_MCAST)
+ 	static uint8_t mcast_group_idx[] = {
+ 		0x04, /** Admin-Local scope multicast address */
+ 		0x05, /** Site-Local scope multicast address */
+@@ -678,10 +731,19 @@ static void openthread_border_router_add_or_rm_route_to_multicast_groups(bool ad
+ 			}
+ 		}
+ 	}
++#else
++	/* Multicast route support (CONFIG_NET_ROUTE_MCAST) is disabled: with an
++	 * LTE PPP backbone there is no LAN to forward Thread multicast onto.
++	 */
++	ARG_UNUSED(add);
++#endif /* CONFIG_NET_ROUTE_MCAST */
+ }
+ 
+ void openthread_border_router_remove_checksums_for_eth_offloading_ipv6(struct net_pkt *pkt)
+ {
++#if !defined(CONFIG_NET_L2_ETHERNET)
++	ARG_UNUSED(pkt); /* Checksum offload is an Ethernet-only concept */
++#else
+ 	NET_PKT_DATA_ACCESS_DEFINE(ipv6_access, struct net_ipv6_hdr);
+ 	struct ethernet_config config;
+ 	struct net_ipv6_hdr *ipv6_hdr;
+@@ -754,6 +816,7 @@ void openthread_border_router_remove_checksums_for_eth_offloading_ipv6(struct ne
+ 	}
+ exit:
+ 	net_pkt_set_overwrite(pkt, false);
++#endif /* !CONFIG_NET_L2_ETHERNET */
+ }
+ 
+ #if defined(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_NAT64_TRANSLATOR)
+@@ -800,9 +863,10 @@ exit:
+ static void openthread_border_router_stop_nat64_service(void)
+ {
+ 	if (border_router_ipv4_services_running) {
+-		otInstance *instance = openthread_get_default_instance();
+-
+-		otNat64ClearIp4Cidr(instance);
++		/* The bundled sdk-openthread fork has no otNat64ClearIp4Cidr();
++		 * disabling the translator is sufficient, and a new CIDR is set
++		 * when the service starts again.
++		 */
+ 		openthread_border_router_set_nat64_translator_enabled(false);
+ 		(void)infra_if_nat64_deinit();
+ 

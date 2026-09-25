@@ -1,0 +1,37 @@
+/ {
+	aliases {
+		modem = &modem;
+	};
+
+	chosen {
+		zephyr,entropy = &rng;
+	};
+};
+
+&uart30 {
+	status = "okay";
+	current-speed = <115200>;
+	zephyr,pm-device-runtime-auto;
+	hw-flow-control;
+};
+
+&modem {
+	status = "okay";
+	zephyr,pm-device-runtime-auto;
+};
+
+&psa_rng {
+	status = "disabled";
+};
+
+&rng {
+	status = "okay";
+};
+
+&xo {
+	status = "okay";
+};
+
+&lfclk {
+	status = "okay";
+};

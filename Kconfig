@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kconfig root for the lte_router application.
+
+mainmenu "LTE Thread Border Router"
+
+source "Kconfig.zephyr"

@@ -1,0 +1,34 @@
+diff --git a/modules/openthread/platform/CMakeLists.txt b/modules/openthread/platform/CMakeLists.txt
+index 1554d3bf22..24a299178d 100644
+--- a/modules/openthread/platform/CMakeLists.txt
++++ b/modules/openthread/platform/CMakeLists.txt
+@@ -37,4 +37,29 @@ zephyr_library_sources_ifdef(CONFIG_OPENTHREAD_PLATFORM_MESSAGE_MANAGEMENT ${ZEP
+ zephyr_library_sources_ifdef(CONFIG_SETTINGS ${ZEPHYR_BASE}/modules/openthread/platform/settings.c)
+ zephyr_library_sources_ifndef(CONFIG_LOG_BACKEND_SPINEL ${ZEPHYR_BASE}/modules/openthread/platform/logging.c)
+ 
++# Border Router platform files from Zephyr (NXP integration), not yet referenced by NCS
++# trel.c and dhcp6_pd.c are intentionally omitted: TREL and DHCPv6-PD are disabled and
++# those sources require newer OpenThread APIs than the bundled sdk-openthread fork provides.
++zephyr_library_sources_ifdef(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER
++  ${ZEPHYR_BASE}/modules/openthread/platform/infra_if.c
++  ${ZEPHYR_BASE}/modules/openthread/platform/udp.c
++  ${ZEPHYR_BASE}/modules/openthread/platform/mdns_socket.c
++  ${ZEPHYR_BASE}/modules/openthread/platform/border_agent.c
++  ${ZEPHYR_BASE}/modules/openthread/platform/dns_upstream_resolver.c
++)
++
++if(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER)
++  zephyr_library_include_directories(${ZEPHYR_BASE}/subsys/net/ip)
++  zephyr_library_include_directories(${ZEPHYR_BASE}/subsys/net/lib/sockets)
++  zephyr_include_directories(${ZEPHYR_BASE}/subsys/net/l2/openthread)
++  zephyr_library_include_directories(${ZEPHYR_BASE}/subsys/net/lib/dns)
++  # OpenThread core internals (common/code_utils.hpp etc.). Upstream Zephyr
++  # gets these via zephyr_link_libraries(ot-config...) usage requirements;
++  # NCS links with target_link_libraries(zephyr PRIVATE ...), so add them here.
++  zephyr_library_include_directories(
++    ${ZEPHYR_CURRENT_MODULE_DIR}/src
++    ${ZEPHYR_CURRENT_MODULE_DIR}/src/core
++  )
++endif()
++
+ zephyr_include_directories(. ${ZEPHYR_BASE}/modules/openthread/platform)
