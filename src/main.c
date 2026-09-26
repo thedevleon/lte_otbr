@@ -11,6 +11,7 @@
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/ppp.h>
+#include <openthread.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -54,6 +55,35 @@ static void net_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_
 	}
 }
 
+static bool thread_started;
+
+/*
+ * OpenThread API calls (ifconfig up + thread start) are deep and do not fit
+ * the main stack — calling openthread_run() directly from main() overflowed
+ * it and the PSPLIM guard halted the system (observed on-target).
+ * The system workqueue has a 4096-byte stack, like the OT shell path.
+ */
+static void start_thread_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	if (thread_started) {
+		return;
+	}
+
+	err = openthread_run();
+	if (err != 0) {
+		LOG_ERR("Failed to start OpenThread (%d)", err);
+		return;
+	}
+
+	thread_started = true;
+}
+
+static K_WORK_DEFINE(start_thread_work, start_thread_work_handler);
+
 int main(void)
 {
 	struct net_if *ppp_iface;
@@ -77,7 +107,34 @@ int main(void)
 		(void)net_if_up(ppp_iface);
 	}
 
+	/*
+	 * Start the Thread stack only once the LTE backbone has its IPv4
+	 * address: the border router must see a ready AIL when Thread starts,
+	 * otherwise it never publishes the on-mesh and NAT64 prefixes to
+	 * network data (observed on-target). Poll once a second instead of
+	 * relying on net_mgmt events. Thread is started from the system
+	 * workqueue because openthread_run() is too deep for the main stack.
+	 */
 	while (true) {
+		if (!thread_started && ppp_iface != NULL) {
+			struct net_in_addr *ipv4_addr;
+
+			ipv4_addr = net_if_ipv4_get_global_addr(ppp_iface, NET_ADDR_PREFERRED);
+			if (ipv4_addr != NULL) {
+				/*
+				 * PPP is point-to-point and the peer hands us no
+				 * gateway, but without a default route the IPv4 route
+				 * lookup used by the NAT64 raw-socket egress fails
+				 * (default iface is thread0). Use our own address as
+				 * the dummy gateway and make PPP the default interface.
+				 */
+				net_if_ipv4_set_gw(ppp_iface, ipv4_addr);
+				net_if_set_default(ppp_iface);
+				LOG_INF("PPP IPv4 up, default route set, starting Thread");
+				k_work_submit(&start_thread_work);
+			}
+		}
+
 		if (gpio_is_ready_dt(&led)) {
 			(void)gpio_pin_toggle_dt(&led);
 		}

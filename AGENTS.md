@@ -86,18 +86,69 @@ west build --build-dir build . --pristine --board nrf93m1dk/nrf54l15/cpuapp
 
 Flashing/debugging is done through the nRF Connect VS Code extension (nrfjprog/J-Link).
 
-**Status 2026-09-26: builds and links clean.** FLASH 733540 B (47% of 1524K), RAM 259336 B
-(98.9% of 256K — only ~2.8K slack, see the RAM warning under Project layout). One benign
+**Status 2026-09-26: builds, links, and boots clean with populated storage.** FLASH ~733K
+(47% of 1524K), RAM fits after the net_buf 40+40 → 32+32 cut. One benign
 warning remains: `-Waddress-of-packed-member` on `aMessageInfo->mPeerAddr` in
 `modules/openthread/platform/udp.c` (byte-wise reads only, safe on Cortex-M33).
+
+On-target verified: PPP up (CGNAT IPv4), Thread auto-starts to `leader` (workqueue),
+`ot br state` = running, on-mesh prefix + GUA published, and **NAT64 fully active**:
+`PrefixManager: Active` + `Translator: Active` (needed the two fixes below). Stack
+headroom after boot (`kernel thread stacks`): main peak 3348/6144 — the boot-time CRACEN
+chain needs ~3.3K, so 3072 was indeed doomed; sysworkq 1364/4096 (runs `openthread_run()`);
+all other threads ≤ 41%.
+
+The two NAT64 fixes: `start_nat64_service()` in
+`openthread_border_router.c` no longer requires a gateway address (PPP is point-to-point,
+gateway is 0.0.0.0 — that check had blocked `otNat64SetIp4Cidr()` entirely), and `src/main.c`
+installs an IPv4 default route on the PPP iface (gw = own address, `net_if_set_default()`)
+so NAT64 raw-socket egress doesn't misroute to thread0.
+
+**Ordering gotcha (fixed and verified):** Thread must start only *after* the PPP AIL has its
+IPv4 address.
+Starting it at boot (~0.5 s, IPCP finishes ~5-8 s later) left `ot netdata show` completely
+empty — no on-mesh prefix, no NAT64 prefix, no GUA on thread0 — even though `ot br state`
+and `ot nat64 state` looked active. The app now polls once per second and starts Thread
+(via the workqueue) only when the PPP iface has a global IPv4. Note:
+`NET_EVENT_IPV4_ADDR_ADD` proved unreliable for triggering this (handler never observed to
+fire for the PPP iface) — hence polling, not events.
+
+With the ordering fix, network data is fully published (verified 2026-09-26): on-mesh
+prefix `fd4b:1551:f28:1::/64` (paos), ULA default route `fc00::/7`, and **NAT64 prefix
+`fd4b:1551:f28:2::/96`** (flag `s`); thread0 gets a GUA, ppp0 shows gw = own address and is
+the default interface. These prefixes are randomly generated when the BR forms the network,
+so they change after a storage erase or factory reset — always read the current values from
+`ot netdata show`, don't hardcode them. Ping target for 8.8.8.8 through NAT64:
+`<nat64prefix>:0808:0808` (e.g. `fd4b:1551:f28:2:0:0:0808:0808`).
+
+**Boot-hang gotcha (observed on-target 2026-09-26, root-caused via J-Link):** once the
+storage partition (0x174000, 36K ZMS for settings/secure-storage) holds data, the boot-time
+secure-storage AEAD key derivation runs the deep CRACEN/sxsymcrypt chain
+(`its_transform_aead_get_key_huk` → `hw_unique_key_derive_key` → SP800-108 CTR KDF →
+`sx_cmdma_*`) on the main stack during sysinit. With `MAIN_STACK_SIZE=3072` this overflows,
+the ARMv8-M PSPLIM guard raises `K_ERR_STACK_CHK_FAIL`, the fatal handler halts the CPU,
+and because NCS routes printk through deferred logging the buffered boot banner is never
+flushed — the board looks completely dead (no UART, no LED). First boot after flashing
+always works (empty storage), every later boot dies. Fixes: `MAIN_STACK_SIZE=6144`
+(paid for by cutting net_buf 40+40 to 32+32), Thread start moved to the system workqueue
+(`start_thread_work` in `src/main.c`, 4096-byte stack — never run `openthread_run()` on the
+main stack, and keep `CONFIG_OPENTHREAD_MANUAL_START=y` so it isn't run during sysinit
+either). Field recovery without reflashing: erase the storage partition over J-Link
+(`JLinkExe -device NRF54L15_M33`, `erase 0x174000 0x17CFFF`) and the old firmware boots
+once more. Diagnosis recipe: JLinkExe `h`/`regs`, PC resolves to `arch_system_halt` via
+addr2line, R0 = fatal reason (2 = stack check fail), unwind ESF at PSP for the faulting PC.
 
 ## Bring-up checklist (on-target shell, uart20 115200)
 
 1. `net iface` — expect the OpenThread iface and a PPP iface (with an IPv4 address, e.g.
    10.x CGNAT). If PPP has no address, check registration: `at at+cereg?`, `at at+cgpaddr`.
-2. `ot state` — should become `leader` (static dataset, single device).
-3. `ot br state`, `ot nat64 state`, `ot nat64prefix` — border routing + NAT64 translator
-   should be running once PPP is up (services start on `NET_EVENT_IF_UP` of the AIL).
+2. `ot state` — should become `leader` on its own ~5-10 s after boot (the app starts Thread
+   via `openthread_run()` only once the PPP iface has its IPv4 address; watch for
+   `PPP IPv4 up, default route set, starting Thread` in the log).
+3. `ot br state`, `ot nat64 state` — border routing + NAT64 should be running once PPP is up
+   (`Translator: Active` after the gateway-check fix; services start on `NET_EVENT_IF_UP` of
+   the AIL). `ot nat64prefix` is an InvalidCommand on this fork's CLI — read the published
+   NAT64 prefix from `ot netdata show` instead.
 4. Join a Thread end device (e.g. nRF52840-DK CLI sample, same dataset) — it should get a
    GUA from the BR's on-mesh prefix (`ot ipaddr` on the ED).
 5. From the ED, ping a public IPv4 through the NAT64 prefix:
@@ -114,15 +165,26 @@ warning remains: `-Waddress-of-packed-member` on `aMessageInfo->mPeerAddr` in
   translator, SRP server, DNS upstream forwarding, static Thread dataset, shells. TREL,
   DHCPv6-PD, SRP/mDNS proxies and backbone multicast routing are intentionally off (no LAN
   behind an LTE link). **RAM is extremely tight** (nRF54L15 has 256K; the OT instance alone is
-  ~74K bss): `NET_TCP=n`, heap 48K, mbedtls heap 4K, OT message buffers 64, net_buf 48+48,
-  reduced stacks everywhere. Think twice before raising any buffer/stack/heap setting — check
+  ~74K bss): `NET_TCP=n`, heap 40K, mbedtls heap 2K, OT message buffers 96 (Kconfig floor),
+  net_buf 32+32, net_pkt 14+14, `NRF_802154_RX_BUFFERS=12`, reduced stacks everywhere —
+  except `MAIN_STACK_SIZE=6144`, which is load-bearing (boot-time CRACEN key derivation,
+  see the gotcha in the status section).
+  Think twice before raising any buffer/stack/heap setting — check
   the overflow with a build first. Flash has headroom (~750K of 1.5M used).
 - `boards/nrf93m1dk_nrf54l15_cpuapp.conf` — UART async + CMUX sizing (required with PM runtime),
   carrier APN `simbase`.
 - `boards/nrf93m1dk_nrf54l15_cpuapp.overlay` — enables `uart30` (115200, HWFC) + `modem`,
   `rng` as entropy source (`psa_rng` disabled), `xo`/`lfclk`.
 - `src/main.c` — brings the PPP interface up (found by L2 type, never by fixed index), logs
-  net_mgmt connectivity events, heartbeat on `led2` (green, P2.10). Border router services are
+  net_mgmt connectivity events, heartbeat on `led2` (green, P2.10). Once per second the main
+  loop checks whether the PPP iface has a global IPv4 yet; when it does, it installs an IPv4
+  default route (gateway = own address — PPP is point-to-point so the value is a dummy;
+  without a default route the NAT64 raw-socket egress would misroute to the default thread0
+  iface), makes PPP the default interface, and starts the Thread stack from the **system
+  workqueue** (`start_thread_work` → `openthread_run()`; the main stack is too small for OT
+  API calls, see the gotcha in the status section). Thread must start after the AIL is
+  ready or the BR never publishes prefixes to network data (ordering gotcha, status
+  section). Border router services are
   started automatically by the Zephyr OTBR integration when the PPP interface comes up.
 - `support/` — nRF93M1 datasheet v0.7 + cellular AT commands v1.0 PDFs. Consult these for modem
   behavior, not generic nRF91 assumptions.
@@ -137,7 +199,8 @@ warning remains: `-Waddress-of-packed-member` on `aMessageInfo->mPeerAddr` in
 
 ## Useful on-target shell commands
 
-- `ot state`, `ot dataset active`, `ot br state`, `ot nat64 state`, `ot nat64prefix`
+- `ot state`, `ot dataset active`, `ot br state`, `ot nat64 state`, `ot netdata show`
+  (`ot nat64prefix` is an InvalidCommand on this fork's CLI)
 - `net iface`, `net ipv6`, `net ppp` — network/PPP state
 - `at` — raw AT commands to the modem (over CMUX user pipe, works while PPP is up)
 

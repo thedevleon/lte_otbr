@@ -349,7 +349,7 @@ index 8b97291e991..550dce304bb 100644
  		mreq.ipv6mr_ifindex = ail_iface_index;
  		break;
 diff --git a/subsys/net/l2/openthread/openthread_border_router.c b/subsys/net/l2/openthread/openthread_border_router.c
-index 5865e0de58d..9b08e511070 100644
+index 5865e0de58d..9ae983b36ce 100644
 --- a/subsys/net/l2/openthread/openthread_border_router.c
 +++ b/subsys/net/l2/openthread/openthread_border_router.c
 @@ -21,6 +21,9 @@
@@ -590,7 +590,26 @@ index 5865e0de58d..9b08e511070 100644
  }
  
  #if defined(CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_NAT64_TRANSLATOR)
-@@ -800,9 +863,10 @@ exit:
+@@ -772,14 +835,15 @@ static int openthread_border_router_start_nat64_service(void)
+ 	int error = 0;
+ 	otInstance *instance = openthread_get_default_instance();
+ 	struct net_in_addr *ipv4_addr = NULL;
+-	struct net_in_addr ipv4_def_route = {0};
+ 	bool translator_state = false;
+ 	otIp4Cidr cidr;
+ 
+ 	ipv4_addr = net_if_ipv4_get_global_addr(ail_iface_ptr, NET_ADDR_PREFERRED);
+-	ipv4_def_route = net_if_ipv4_get_gw(ail_iface_ptr);
+ 
+-	if (ipv4_addr != NULL && ipv4_def_route.s_addr != 0) {
++	/* No gateway check here: point-to-point links (PPP/LTE) have no
++	 * gateway address, the peer is always reachable on-link.
++	 */
++	if (ipv4_addr != NULL) {
+ 		if (infra_if_nat64_init() == 0) {
+ 			memcpy(&cidr.mAddress.mFields.m32, &(ipv4_addr->s_addr),
+ 			       sizeof(otIp4Address));
+@@ -800,9 +864,10 @@ exit:
  static void openthread_border_router_stop_nat64_service(void)
  {
  	if (border_router_ipv4_services_running) {
