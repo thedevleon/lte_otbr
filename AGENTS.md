@@ -121,6 +121,40 @@ so they change after a storage erase or factory reset — always read the curren
 `ot netdata show`, don't hardcode them. Ping target for 8.8.8.8 through NAT64:
 `<nat64prefix>:0808:0808` (e.g. `fd4b:1551:f28:2:0:0:0808:0808`).
 
+**End-to-end verified 2026-09-26:** a Thread ED (nRF52840 dongle RCP + `ot-cli` on the Linux
+host, Spinel/HDLC at 115200) joined, got a GUA, pinged 8.8.8.8 through NAT64 over LTE
+(~150 ms, 0% loss), and resolved `google.com` via the BR's DNS upstream forwarding
+(ED auto-discovers the BR as DNS server from the SRP service in netdata; BR log shows
+`DnssdServer: Received query` → `Upstream query transaction ... completed` over PPP).
+The SRP server initially would not start — boot log showed
+`SrpServer: Failed to prepare socket: InvalidState` in a retry loop. Root cause:
+`CONFIG_OPENTHREAD_ZEPHYR_BORDER_ROUTER_MAX_UDP_SERVICES=5` (default) is exhausted by
+TMF/DNS-SD/Border-Agent/mDNS sockets, so `otPlatUdpSocket()` rejects the SRP server's socket
+with `OT_ERROR_INVALID_STATE`; bumped to 8 in `prj.conf`. Raising that cap requires
+`CONFIG_ZVFS_POLL_MAX=20` too — with 8 UDP services the socket service needs 17 poll
+entries, and with the default 16 the `net_sock_svc` thread fails to start at all, which
+also kills PPP DNS setup and the NAT64 translator socket (observed on-target). Note the SRP server state machine
+also wedges in `Stopped` after such a failure (`Enable()` only runs from `Disabled`), and
+`ot srp server enable` prints `Done` regardless because the API returns void — check
+`ot srp server state`, not the CLI's `Done`. For OT logs set
+`CONFIG_OPENTHREAD_DEBUG=y` + `CONFIG_OPENTHREAD_LOG_LEVEL_INFO=y` (the level choice depends
+on the former; removed from `prj.conf` after diagnosis).
+
+Two warts seen during the DNS test, benign so far but worth knowing: `Nat64: no mapping
+found for the IPv4 address` + `openthread_nat64_send error 2` warnings fire when the
+upstream DNS query egresses (query still completes), and the upstream resolver returns AAAA
+records for dual-stack names — on the IPv4-only LTE uplink those IPv6 addresses are
+unreachable, so real ED applications should query A records and use the NAT64 prefix
+(the OT DNS client `Nat64Mode` handles this).
+
+**Leadership gotcha:** if another leader with the same dataset is alive when the BR boots
+(e.g. the host ot-cli dongle left running from a test), the partitions merge and the BR
+demotes to a *child* — BR features keep half-working (NAT64 translator activates, SRP
+listens) but DUA registration fails and the topology is wrong. Two defenses: the app now
+sets `otThreadSetLocalLeaderWeight(UINT8_MAX)` before `openthread_run()` so the BR wins
+merges, and in tests always let the BR become `leader` first (`thread stop` on the other
+device, reboot BR, check `ot state`, then `thread start` the joiner).
+
 **Boot-hang gotcha (observed on-target 2026-09-26, root-caused via J-Link):** once the
 storage partition (0x174000, 36K ZMS for settings/secure-storage) holds data, the boot-time
 secure-storage AEAD key derivation runs the deep CRACEN/sxsymcrypt chain

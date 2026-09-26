@@ -12,6 +12,7 @@
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/ppp.h>
 #include <openthread.h>
+#include <openthread/thread.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
