@@ -192,6 +192,29 @@ addr2line, R0 = fatal reason (2 = stack check fail), unwind ESF at PSP for the f
    errors (e.g. `otBorderRoutingInit` failing without a global IPv6 on the AIL — expected
    on IPv4-only LTE, NAT64 path should still work).
 
+## RAM budget (measured 2026-09-26) and nRF54LM20 (512K) recommendations
+
+Current 256K build: **253,236 B used of 262,144 B (96.6%), ~8.7K slack**. Biggest blocks
+(from `nm --print-size` on `zephyr.elf`): OT instance 74,208; system heap 41,044
+(`HEAP_MEM_POOL_SIZE=40960`, also holds the 96 OT message buffers at runtime); thread
+stacks ~39,300 total; net_buf data 16,384 (32+32 × 256B); BR message slab 15,600;
+modem/PPP/CMUX ~10,700; IPv6/context/conn tables ~7,800; ZMS 4,192; DNS ~4,500;
+radio ~3,100; net_pkt slabs 2,912; mbedtls heap 2,048.
+
+Key compromises vs defaults: heap 128K→40K (biggest single cut), `NET_TCP=n`,
+net_buf 40+40→32+32, net_pkt 14+14, OT message buffers at the 96 Kconfig floor, stacks at
+measured minimums (except main 6144 — forced by the CRACEN boot chain), radio RX bufs
+20→12, mbedtls heap →2K (CRACEN does the crypto), DNS concurrency 2, contexts/conns 12/12.
+
+For an nRF54LM20 (512K) build, in payoff order — Tier 1 (throughput/stability):
+`HEAP_MEM_POOL_SIZE=131072`, `NET_BUF_RX/TX_COUNT=64/64`, `NET_PKT_RX/TX_COUNT=28/28`,
+`OPENTHREAD_NUM_MESSAGE_BUFFERS=256`. Tier 2 (features): `NET_TCP=y`,
+`MBEDTLS_HEAP_SIZE=16384`, `DNS_NUM_CONCUR_QUERIES=5`, `NET_MAX_CONTEXTS/CONN=24/24`,
+`ZVFS_POLL_MAX=32`, `NRF_802154_RX_BUFFERS=20`. Tier 3 (margins): `NET_RX_STACK_SIZE=3072`,
+`SHELL_STACK_SIZE=4096`, `LOG_BUFFER_SIZE=4096`. Total ≈ +135K → ~390K/512K used, leaving
+~120K for an on-BR application. NOT worth enabling even with RAM: TREL, DHCPv6-PD,
+SRP/mDNS proxies, BBR multicast (off by architecture — no LAN behind LTE, not by RAM).
+
 ## Project layout
 
 - `prj.conf` — app Kconfig: dual-stack networking, PPP + `modem_cellular`, OpenThread FTD with
@@ -220,6 +243,7 @@ addr2line, R0 = fatal reason (2 = stack check fail), unwind ESF at PSP for the f
   ready or the BR never publishes prefixes to network data (ordering gotcha, status
   section). Border router services are
   started automatically by the Zephyr OTBR integration when the PPP interface comes up.
+- `README.md` — project overview, build/flash, bring-up and end-device test instructions.
 - `support/` — nRF93M1 datasheet v0.7 + cellular AT commands v1.0 PDFs. Consult these for modem
   behavior, not generic nRF91 assumptions.
 
