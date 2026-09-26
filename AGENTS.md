@@ -230,7 +230,8 @@ SRP/mDNS proxies, BBR multicast (off by architecture — no LAN behind LTE, not 
   the overflow with a build first. Flash has headroom (~750K of 1.5M used).
 - `boards/nrf93m1dk_nrf54l15_cpuapp.conf` — UART async + CMUX sizing (required with PM runtime),
   carrier APN `simbase`.
-- `boards/nrf93m1dk_nrf54l15_cpuapp.overlay` — enables `uart30` (115200, HWFC) + `modem`,
+- `boards/nrf93m1dk_nrf54l15_cpuapp.overlay` — enables `uart30` (921600, HWFC — see
+  "Modem UART baud rate" below) + `modem`,
   `rng` as entropy source (`psa_rng` disabled), `xo`/`lfclk`.
 - `src/main.c` — brings the PPP interface up (found by L2 type, never by fixed index), logs
   net_mgmt connectivity events, heartbeat on `led2` (green, P2.10). Once per second the main
@@ -246,6 +247,32 @@ SRP/mDNS proxies, BBR multicast (off by architecture — no LAN behind LTE, not 
 - `README.md` — project overview, build/flash, bring-up and end-device test instructions.
 - `support/` — nRF93M1 datasheet v0.7 + cellular AT commands v1.0 PDFs. Consult these for modem
   behavior, not generic nRF91 assumptions.
+
+## Modem UART baud rate (uart30, +IPR)
+
+The PPP link runs at **921600 baud** (raised from the 115200 sample default; moves the
+internet-throughput ceiling from ~80 kbps to Thread-radio-limited). The modem's baud rate
+is set with `AT+IPR=<rate>` and **stored in modem NVM**, so host and modem must be changed
+in this order:
+
+1. With OLD (115200) firmware running, use the shell: `at at+ipr=921600` → `OK`
+   (the modem switches baud right after sending the response; the session then goes silent,
+   which is expected).
+2. Flash firmware whose overlay has `current-speed = <921600>`.
+
+If the order is reversed (or the modem NVM is ever reset), PPP/chat never comes up.
+Recovery: flash any build with `current-speed = <115200>`, then redo step 1.
+Supported rates per the nRF93M1 AT reference: up to 921600 and 3000000; 921600 is the
+chosen step (8× headroom over need) — 3000000 is untested (UARTE30 can do it, but
+HDLC+CMUX CPU load at that rate on the M33 is unverified). HW flow control (already in the overlay) is mandatory
+above 115200.
+
+**Do NOT use autobaud (`AT+IPR=0`)** — tested on target 2026-09-26, PPP/chat never comes up.
+Autobaud detection needs a clean `AT` on an idle line; Zephyr starts transmitting `ATE0`
+~0.6 s after modem power-on (mid-boot), the detector mis-locks and never re-arms, and the
+modem stays deaf at any host baud until rebooted (bypass sample works because the line is
+idle long before the user types). Recovery from IPR=0: bypass sample, `AT` at 115200 until
+`OK`, then `AT+IPR=115200`, power-cycle.
 
 ## Carrier facts (probed 2026-09-25)
 

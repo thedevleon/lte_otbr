@@ -10,7 +10,10 @@
 
 &uart30 {
 	status = "okay";
-	current-speed = <115200>;
+	/* 921600 requires the modem's +IPR to be programmed to 921600 once
+	 * (stored in modem NVM) BEFORE flashing this — see AGENTS.md.
+	 * HW flow control is mandatory above 115200. */
+	current-speed = <921600>;
 	zephyr,pm-device-runtime-auto;
 	hw-flow-control;
 };
